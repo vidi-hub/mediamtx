@@ -30,8 +30,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
-      - name: Unit tests — RTMP stream-key path carriage (ADR-019-003)
-        run: go test -count=1 ./internal/servers/rtmp/...
+      - name: Unit tests — RTMP stream-key path carriage (ADR-019-003) + conf round-trip
+        run: go test -count=1 ./internal/conf/... ./internal/servers/rtmp/...
 
   binaries:
     needs: test
