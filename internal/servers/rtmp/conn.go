@@ -23,16 +23,10 @@ import (
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
-// rtmpCredentialApp is the fixed publisher-facing RTMP app under which a publish
-// credential is carried as a trailing path segment (ADR-019-003). A publish URL of
-// the form rtmp(s)://host/live/<liveStreamId>/<token> is authenticated by internal
-// auth and the <token> segment is stripped to the canonical path live/<liveStreamId>
-// before routing, the paths map, the API, metrics, external commands and logs see it.
-const rtmpCredentialApp = "live"
-
 type conn struct {
 	parentCtx           context.Context
 	encryption          bool
+	streamKeyApp        string
 	rtspAddress         string
 	readTimeout         conf.Duration
 	writeTimeout        conf.Duration
@@ -236,26 +230,30 @@ func (c *conn) runRead() error {
 	}
 }
 
-// parsePublishAccess ADDS ADR-019-003 RTMP stream-key path-segment auth for PUBLISH,
-// without removing any of MediaMTX's existing auth. When the client path is exactly
-// live/<liveStreamId>/<token> (3 segments under the "live" app), the trailing <token>
-// segment is consumed as the publish credential: the canonical path MediaMTX keys on
-// becomes live/<liveStreamId> (token stripped from every routing/telemetry surface),
-// and Credentials are populated with User=<liveStreamId>, Pass=<token>, validated by the
-// existing internal-auth Pass.Check. An empty <liveStreamId> or empty <token> still
-// takes this branch and fails closed at auth (no permission match / empty-hash mismatch).
+// parsePublishAccess ADDS ADR-019-003 RTMP stream-key path-segment auth for PUBLISH.
+// It is OPT-IN and OFF by default: the behaviour is active only when streamKeyApp (the
+// rtmpStreamKeyApp config option) is non-empty. When disabled (the default, and the
+// case for every MediaMTX deployment that does not need this feature — e.g. CameraHost),
+// this function is a no-op pass-through and the server keeps its stock auth verbatim.
 //
-// Every other path shape — non-"live" apps, the bare live/<liveStreamId> identity path,
-// and deeper live/a/b/c paths — keeps MediaMTX's existing behaviour unchanged: the raw
-// path name plus query-string (user/pass) credentials. This is purely additive; the
-// query carriage and normal path auth are NOT removed (whether a deployment uses only
-// the stream-key form is a config decision, enforced by the minted publish permission).
-func parsePublishAccess(rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials) {
-	segments := strings.Split(rawPath, "/")
-
-	if len(segments) == 3 && segments[0] == rtmpCredentialApp {
-		return rtmpCredentialApp + "/" + segments[1],
-			auth.Credentials{User: segments[1], Pass: segments[2]}
+// When enabled and the client path is exactly <streamKeyApp>/<liveStreamId>/<token>
+// (3 segments whose first segment equals streamKeyApp), the trailing <token> segment is
+// consumed as the publish credential: the canonical path MediaMTX keys on becomes
+// <streamKeyApp>/<liveStreamId> (token stripped from every routing/telemetry surface),
+// and Credentials are populated with User=<liveStreamId>, Pass=<token>, validated by the
+// existing internal-auth Pass.Check. An empty <liveStreamId> or empty <token> still takes
+// this branch and fails closed at auth (no permission match / empty-hash mismatch).
+//
+// Every other path shape keeps MediaMTX's existing behaviour unchanged: the raw path
+// name plus query-string (user/pass) credentials. The change is purely additive and
+// gated, so it cannot affect any path or any other deployment that does not opt in.
+func parsePublishAccess(streamKeyApp, rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials) {
+	if streamKeyApp != "" {
+		segments := strings.Split(rawPath, "/")
+		if len(segments) == 3 && segments[0] == streamKeyApp {
+			return streamKeyApp + "/" + segments[1],
+				auth.Credentials{User: segments[1], Pass: segments[2]}
+		}
 	}
 
 	return rawPath, auth.Credentials{User: queryUser, Pass: queryPass}
@@ -265,7 +263,7 @@ func (c *conn) runPublish() error {
 	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
 	query := c.rconn.URL.Query()
 
-	canonicalName, creds := parsePublishAccess(pathName, query.Get("user"), query.Get("pass"))
+	canonicalName, creds := parsePublishAccess(c.streamKeyApp, pathName, query.Get("user"), query.Get("pass"))
 
 	r := &gortmplib.Reader{
 		Conn: c.rconn,

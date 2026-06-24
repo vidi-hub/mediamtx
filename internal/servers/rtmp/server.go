@@ -79,6 +79,7 @@ type Server struct {
 	ReadTimeout         conf.Duration
 	WriteTimeout        conf.Duration
 	Encryption          bool
+	StreamKeyApp        string
 	ServerCert          string
 	ServerKey           string
 	RTSPAddress         string
@@ -267,6 +268,7 @@ outer:
 			c := &conn{
 				parentCtx:           s.ctx,
 				encryption:          s.Encryption,
+				streamKeyApp:        s.StreamKeyApp,
 				rtspAddress:         s.RTSPAddress,
 				readTimeout:         s.ReadTimeout,
 				writeTimeout:        s.WriteTimeout,
