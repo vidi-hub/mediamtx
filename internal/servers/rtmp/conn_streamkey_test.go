@@ -4,8 +4,9 @@ import (
 	"testing"
 )
 
-// TestParsePublishAccess covers the ADR-019-003 RTMP stream-key path-carriage
-// segment-count contract for PUBLISH.
+// TestParsePublishAccess covers the ADR-019-003 RTMP stream-key path-segment auth for
+// PUBLISH. The change is ADDITIVE: only the exact live/<id>/<token> form is treated as a
+// stream-key; every other path shape keeps MediaMTX's existing query/path auth.
 func TestParsePublishAccess(t *testing.T) {
 	for _, ca := range []struct {
 		name          string
@@ -15,87 +16,78 @@ func TestParsePublishAccess(t *testing.T) {
 		wantCanonical string
 		wantUser      string
 		wantPass      string
-		wantOK        bool
 	}{
 		{
-			name:          "target carriage strips token to canonical path",
+			name:          "stream-key: strips token to canonical path, binds user to id",
 			rawPath:       "live/abcdef/secrettoken",
 			wantCanonical: "live/abcdef",
 			wantUser:      "abcdef", // bound to the liveStreamId (per-path scope)
 			wantPass:      "secrettoken",
-			wantOK:        true,
 		},
 		{
-			name:          "interim query carriage is unchanged (2 segments)",
+			name:          "stream-key ignores any query credentials (path token wins)",
+			rawPath:       "live/abcdef/pathtoken",
+			queryUser:     "attacker",
+			queryPass:     "querytoken",
+			wantCanonical: "live/abcdef",
+			wantUser:      "abcdef",
+			wantPass:      "pathtoken",
+		},
+		{
+			name:          "stream-key empty token (trailing slash) -> fails closed at auth",
+			rawPath:       "live/abcdef/",
+			wantCanonical: "live/abcdef",
+			wantUser:      "abcdef",
+			wantPass:      "", // empty pass -> hash check fails downstream
+		},
+		{
+			name:          "stream-key empty id -> empty user, no permission matches downstream",
+			rawPath:       "live//secrettoken",
+			wantCanonical: "live/",
+			wantUser:      "",
+			wantPass:      "secrettoken",
+		},
+		{
+			// ADDITIVE: not the 3-segment form -> existing MediaMTX query auth is preserved.
+			name:          "bare live identity path keeps existing query auth (2 segments)",
 			rawPath:       "live/abcdef",
 			queryUser:     "abcdef",
 			queryPass:     "secrettoken",
 			wantCanonical: "live/abcdef",
 			wantUser:      "abcdef",
 			wantPass:      "secrettoken",
-			wantOK:        true,
 		},
 		{
-			name:          "more than 3 segments under live is rejected",
+			// ADDITIVE: deeper than the stream-key form -> NOT rejected, stays vanilla.
+			name:          "more than 3 segments under live keeps existing query auth",
 			rawPath:       "live/abcdef/secrettoken/extra",
-			wantCanonical: "",
-			wantOK:        false,
+			queryUser:     "u",
+			queryPass:     "p",
+			wantCanonical: "live/abcdef/secrettoken/extra",
+			wantUser:      "u",
+			wantPass:      "p",
 		},
 		{
-			name:          "empty token (trailing slash) flows through to fail-closed auth",
-			rawPath:       "live/abcdef/",
-			wantCanonical: "live/abcdef",
-			wantUser:      "abcdef",
-			wantPass:      "", // empty pass -> hash check fails downstream
-			wantOK:        true,
-		},
-		{
-			name:          "empty id flows through with empty user (no permission matches)",
-			rawPath:       "live//secrettoken",
-			wantCanonical: "live/",
-			wantUser:      "",
-			wantPass:      "secrettoken",
-			wantOK:        true,
-		},
-		{
-			name:          "non-live multi-segment path is vanilla, not treated as token",
+			name:          "non-live 3-segment path is vanilla, not treated as stream-key",
 			rawPath:       "foo/bar/baz",
 			queryUser:     "u",
 			queryPass:     "p",
 			wantCanonical: "foo/bar/baz",
 			wantUser:      "u",
 			wantPass:      "p",
-			wantOK:        true,
 		},
 		{
-			name:          "single-segment path is vanilla with query credentials",
+			name:          "single-segment path keeps existing query auth",
 			rawPath:       "mystream",
 			queryUser:     "u",
 			queryPass:     "p",
 			wantCanonical: "mystream",
 			wantUser:      "u",
 			wantPass:      "p",
-			wantOK:        true,
-		},
-		{
-			name:          "target carriage ignores any query credentials",
-			rawPath:       "live/abcdef/pathtoken",
-			queryUser:     "attacker",
-			queryPass:     "querytoken",
-			wantCanonical: "live/abcdef",
-			wantUser:      "abcdef",
-			wantPass:      "pathtoken", // path-segment token wins, query ignored
-			wantOK:        true,
 		},
 	} {
 		t.Run(ca.name, func(t *testing.T) {
-			canonical, creds, ok := parsePublishAccess(ca.rawPath, ca.queryUser, ca.queryPass)
-			if ok != ca.wantOK {
-				t.Fatalf("ok = %v, want %v", ok, ca.wantOK)
-			}
-			if !ok {
-				return
-			}
+			canonical, creds := parsePublishAccess(ca.rawPath, ca.queryUser, ca.queryPass)
 			if canonical != ca.wantCanonical {
 				t.Errorf("canonical = %q, want %q", canonical, ca.wantCanonical)
 			}

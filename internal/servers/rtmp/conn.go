@@ -236,47 +236,36 @@ func (c *conn) runRead() error {
 	}
 }
 
-// parsePublishAccess implements the ADR-019-003 RTMP stream-key path carriage for
-// PUBLISH. From the raw client path (URL.Path, leading slash trimmed) and the query
-// user/pass it returns the canonical path MediaMTX keys on (token stripped) and the
-// credentials to authenticate with.
+// parsePublishAccess ADDS ADR-019-003 RTMP stream-key path-segment auth for PUBLISH,
+// without removing any of MediaMTX's existing auth. When the client path is exactly
+// live/<liveStreamId>/<token> (3 segments under the "live" app), the trailing <token>
+// segment is consumed as the publish credential: the canonical path MediaMTX keys on
+// becomes live/<liveStreamId> (token stripped from every routing/telemetry surface),
+// and Credentials are populated with User=<liveStreamId>, Pass=<token>, validated by the
+// existing internal-auth Pass.Check. An empty <liveStreamId> or empty <token> still
+// takes this branch and fails closed at auth (no permission match / empty-hash mismatch).
 //
-//   - Target carriage  live/<liveStreamId>/<token>  (3 segments under the "live" app):
-//     canonical = live/<liveStreamId>, User = <liveStreamId>, Pass = <token>; query ignored.
-//     An empty <liveStreamId> or empty <token> deliberately flows through to a fail-closed
-//     auth-deny (no permission matches / the hash check fails) rather than a distinct
-//     reject, keeping the rejection surface uniform with a wrong token.
-//   - Interim carriage  live/<liveStreamId>?user=&pass=  (fewer than 3 segments) and every
-//     non-"live" app: unchanged vanilla behaviour (credentials from the query). This keeps
-//     dual-acceptance so already-provisioned interim devices keep authenticating.
-//   - More than 3 segments under "live": ambiguous id/token split -> rejected (ok=false).
-//     The token never reaches the path manager or any telemetry surface on this branch.
-func parsePublishAccess(rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials, ok bool) {
+// Every other path shape — non-"live" apps, the bare live/<liveStreamId> identity path,
+// and deeper live/a/b/c paths — keeps MediaMTX's existing behaviour unchanged: the raw
+// path name plus query-string (user/pass) credentials. This is purely additive; the
+// query carriage and normal path auth are NOT removed (whether a deployment uses only
+// the stream-key form is a config decision, enforced by the minted publish permission).
+func parsePublishAccess(rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials) {
 	segments := strings.Split(rawPath, "/")
 
-	if segments[0] == rtmpCredentialApp {
-		switch {
-		case len(segments) == 3:
-			return rtmpCredentialApp + "/" + segments[1],
-				auth.Credentials{User: segments[1], Pass: segments[2]},
-				true
-
-		case len(segments) > 3:
-			return "", auth.Credentials{}, false
-		}
+	if len(segments) == 3 && segments[0] == rtmpCredentialApp {
+		return rtmpCredentialApp + "/" + segments[1],
+			auth.Credentials{User: segments[1], Pass: segments[2]}
 	}
 
-	return rawPath, auth.Credentials{User: queryUser, Pass: queryPass}, true
+	return rawPath, auth.Credentials{User: queryUser, Pass: queryPass}
 }
 
 func (c *conn) runPublish() error {
 	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
 	query := c.rconn.URL.Query()
 
-	canonicalName, creds, ok := parsePublishAccess(pathName, query.Get("user"), query.Get("pass"))
-	if !ok {
-		return fmt.Errorf("invalid RTMP publish path")
-	}
+	canonicalName, creds := parsePublishAccess(pathName, query.Get("user"), query.Get("pass"))
 
 	r := &gortmplib.Reader{
 		Conn: c.rconn,
