@@ -347,6 +347,7 @@ type Conf struct {
 	RTMPServerKey      string     `json:"rtmpServerKey"`
 	RTMPServerCert     string     `json:"rtmpServerCert"`
 	RTMPTrustedProxies IPNetworks `json:"rtmpTrustedProxies"`
+	RTMPStreamKeyApp   string     `json:"rtmpStreamKeyApp"`
 
 	// HLS server
 	HLS                bool       `json:"hls"`

@@ -566,6 +566,7 @@ func (p *Core) createResources(initial bool) error {
 			ServerKey:           "",
 			RTSPAddress:         p.conf.RTSPAddress,
 			TrustedProxies:      p.conf.RTMPTrustedProxies,
+			StreamKeyApp:        p.conf.RTMPStreamKeyApp,
 			RunOnConnect:        p.conf.RunOnConnect,
 			RunOnConnectRestart: p.conf.RunOnConnectRestart,
 			RunOnDisconnect:     p.conf.RunOnDisconnect,
@@ -595,6 +596,7 @@ func (p *Core) createResources(initial bool) error {
 			DumpPackets:         p.conf.DumpPackets,
 			RTSPAddress:         p.conf.RTSPAddress,
 			TrustedProxies:      p.conf.RTMPTrustedProxies,
+			StreamKeyApp:        p.conf.RTMPStreamKeyApp,
 			RunOnConnect:        p.conf.RunOnConnect,
 			RunOnConnectRestart: p.conf.RunOnConnectRestart,
 			RunOnDisconnect:     p.conf.RunOnDisconnect,
@@ -915,6 +917,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.RTMP != p.conf.RTMP ||
 		newConf.RTMPEncryption != p.conf.RTMPEncryption ||
 		newConf.RTMPAddress != p.conf.RTMPAddress ||
+		newConf.RTMPStreamKeyApp != p.conf.RTMPStreamKeyApp ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		newConf.ReadTimeout != p.conf.ReadTimeout ||
 		newConf.WriteTimeout != p.conf.WriteTimeout ||
@@ -931,6 +934,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.RTMP != p.conf.RTMP ||
 		newConf.RTMPEncryption != p.conf.RTMPEncryption ||
 		newConf.RTMPSAddress != p.conf.RTMPSAddress ||
+		newConf.RTMPStreamKeyApp != p.conf.RTMPStreamKeyApp ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		newConf.ReadTimeout != p.conf.ReadTimeout ||
 		newConf.WriteTimeout != p.conf.WriteTimeout ||
