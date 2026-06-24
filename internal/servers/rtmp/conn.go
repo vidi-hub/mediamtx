@@ -23,6 +23,13 @@ import (
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
+// rtmpCredentialApp is the fixed publisher-facing RTMP app under which a publish
+// credential is carried as a trailing path segment (ADR-019-003). A publish URL of
+// the form rtmp(s)://host/live/<liveStreamId>/<token> is authenticated by internal
+// auth and the <token> segment is stripped to the canonical path live/<liveStreamId>
+// before routing, the paths map, the API, metrics, external commands and logs see it.
+const rtmpCredentialApp = "live"
+
 type conn struct {
 	parentCtx           context.Context
 	encryption          bool
@@ -229,9 +236,47 @@ func (c *conn) runRead() error {
 	}
 }
 
+// parsePublishAccess implements the ADR-019-003 RTMP stream-key path carriage for
+// PUBLISH. From the raw client path (URL.Path, leading slash trimmed) and the query
+// user/pass it returns the canonical path MediaMTX keys on (token stripped) and the
+// credentials to authenticate with.
+//
+//   - Target carriage  live/<liveStreamId>/<token>  (3 segments under the "live" app):
+//     canonical = live/<liveStreamId>, User = <liveStreamId>, Pass = <token>; query ignored.
+//     An empty <liveStreamId> or empty <token> deliberately flows through to a fail-closed
+//     auth-deny (no permission matches / the hash check fails) rather than a distinct
+//     reject, keeping the rejection surface uniform with a wrong token.
+//   - Interim carriage  live/<liveStreamId>?user=&pass=  (fewer than 3 segments) and every
+//     non-"live" app: unchanged vanilla behaviour (credentials from the query). This keeps
+//     dual-acceptance so already-provisioned interim devices keep authenticating.
+//   - More than 3 segments under "live": ambiguous id/token split -> rejected (ok=false).
+//     The token never reaches the path manager or any telemetry surface on this branch.
+func parsePublishAccess(rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials, ok bool) {
+	segments := strings.Split(rawPath, "/")
+
+	if segments[0] == rtmpCredentialApp {
+		switch {
+		case len(segments) == 3:
+			return rtmpCredentialApp + "/" + segments[1],
+				auth.Credentials{User: segments[1], Pass: segments[2]},
+				true
+
+		case len(segments) > 3:
+			return "", auth.Credentials{}, false
+		}
+	}
+
+	return rawPath, auth.Credentials{User: queryUser, Pass: queryPass}, true
+}
+
 func (c *conn) runPublish() error {
 	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
 	query := c.rconn.URL.Query()
+
+	canonicalName, creds, ok := parsePublishAccess(pathName, query.Get("user"), query.Get("pass"))
+	if !ok {
+		return fmt.Errorf("invalid RTMP publish path")
+	}
 
 	r := &gortmplib.Reader{
 		Conn: c.rconn,
@@ -254,16 +299,13 @@ func (c *conn) runPublish() error {
 		UseRTPPackets: false,
 		ReplaceNTP:    true,
 		AccessRequest: defs.PathAccessRequest{
-			Name:      pathName,
-			Query:     c.rconn.URL.RawQuery,
-			Publish:   true,
-			UserAgent: c.userAgent,
-			Proto:     auth.ProtocolRTMP,
-			ID:        &c.uuid,
-			Credentials: &auth.Credentials{
-				User: query.Get("user"),
-				Pass: query.Get("pass"),
-			},
+			Name:                 canonicalName,
+			Query:                c.rconn.URL.RawQuery,
+			Publish:              true,
+			UserAgent:            c.userAgent,
+			Proto:                auth.ProtocolRTMP,
+			ID:                   &c.uuid,
+			Credentials:          &creds,
 			IP:                   c.ip(),
 			EnableAskCredentials: false,
 		},
@@ -278,7 +320,7 @@ func (c *conn) runPublish() error {
 
 	c.mutex.Lock()
 	c.state = defs.APIRTMPConnStatePublish
-	c.pathName = pathName
+	c.pathName = canonicalName
 	c.query = c.rconn.URL.RawQuery
 	c.user = res.User
 	c.mutex.Unlock()
