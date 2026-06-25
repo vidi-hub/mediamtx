@@ -2,6 +2,7 @@ package rtmp
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -228,33 +229,89 @@ func (c *conn) runRead() error {
 	}
 }
 
-// parsePublishAccess ADDS ADR-019-003 RTMP stream-key path-segment auth for PUBLISH.
+// v1 packed Stream Key (ADR-019-004): base64url-nopad( version(1B) || liveStreamId(16B)
+// || token(16B) ). 33 decoded bytes -> exactly 44 base64url chars, all in [A-Za-z0-9_-].
+// The 16/16 byte layout is single-sourced here (ADR-019-004 invariant (d)): a wrong
+// literal offset would silently mis-split id/token, so the offsets derive from these.
+const (
+	streamKeyVersion    = 0x01                                                     // v1 layout discriminator (fail-closed)
+	streamKeyVersionLen = 1                                                        // version byte
+	streamKeyIDLen      = 16                                                       // liveStreamId (raw UUID) bytes
+	streamKeyTokenLen   = 16                                                       // 128-bit token bytes
+	streamKeyDecodedLen = streamKeyVersionLen + streamKeyIDLen + streamKeyTokenLen // 33
+	streamKeyEncodedLen = 44                                                       // base64url-nopad(33 bytes), no '='
+)
+
+// parsePublishAccess ADDS the ADR-019-003/004 RTMP packed Stream-Key auth for PUBLISH.
 // It is OPT-IN and OFF by default: the behaviour is active only when streamKeyApp (the
-// rtmpStreamKeyApp config option) is non-empty. When disabled (the default, and the
-// case for every MediaMTX deployment that does not need this feature — e.g. CameraHost),
-// this function is a no-op pass-through and the server keeps its stock auth verbatim.
+// rtmpStreamKeyApp config option) is non-empty. When disabled (the default, and the case
+// for every MediaMTX deployment that does not need this feature — e.g. CameraHost), this
+// function is a no-op pass-through and the server keeps its stock auth verbatim.
 //
-// When enabled and the client path is exactly <streamKeyApp>/<liveStreamId>/<token>
-// (3 segments whose first segment equals streamKeyApp), the trailing <token> segment is
-// consumed as the publish credential: the canonical path MediaMTX keys on becomes
-// <streamKeyApp>/<liveStreamId> (token stripped from every routing/telemetry surface),
-// and Credentials are populated with User=<liveStreamId>, Pass=<token>, validated by the
-// existing internal-auth Pass.Check. An empty <liveStreamId> or empty <token> still takes
-// this branch and fails closed at auth (no permission match / empty-hash mismatch).
+// When enabled, a publish to <streamKeyApp>/<streamKey> (the standard two-segment
+// Server-URL + opaque-Stream-Key shape) is decoded per ADR-019-004: the single Stream-Key
+// segment is base64url-nopad( version(0x01) || liveStreamId(16B) || token(16B) ). The fork
+// decodes it, byte-splits it, reconstructs the canonical lowercase hyphenated UUID from the
+// 16 id bytes, and rewrites the canonical path MediaMTX keys on to <streamKeyApp>/<uuid>
+// (the token never reaches any routing/telemetry surface). Credentials are populated with
+// User=<uuid> and Pass=base64url-nopad(token bytes) — the same string Core hashed at mint
+// (ADR-019-003 §"Hashing": the stored hash is over utf8(base64url token)) — and validated
+// by the existing internal-auth Pass.Check.
 //
-// Every other path shape keeps MediaMTX's existing behaviour unchanged: the raw path
-// name plus query-string (user/pass) credentials. The change is purely additive and
-// gated, so it cannot affect any path or any other deployment that does not opt in.
+// A malformed Stream Key under the enabled app (wrong length, non-base64url char, wrong
+// version byte, or wrong decoded length), or any non-two-segment path under that app,
+// FAILS CLOSED: the canonical path is rewritten to the bare app prefix (no secret-bearing
+// bytes reach telemetry) and credentials are empty, so it cannot authenticate. A well-formed
+// key with a wrong/revoked token decodes normally and is rejected by the auth gate
+// (auth-denied), preserving an indistinguishable rejection surface for credential failures.
+//
+// Every path NOT under the enabled app keeps MediaMTX's existing behaviour unchanged (raw
+// path name + query-string user/pass), so a disabled deployment is byte-identical to stock.
 func parsePublishAccess(streamKeyApp, rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials) {
 	if streamKeyApp != "" {
 		segments := strings.Split(rawPath, "/")
-		if len(segments) == 3 && segments[0] == streamKeyApp {
-			return streamKeyApp + "/" + segments[1],
-				auth.Credentials{User: segments[1], Pass: segments[2]}
+		if segments[0] == streamKeyApp {
+			if len(segments) == 2 {
+				if id, token, ok := decodeStreamKey(segments[1]); ok {
+					return streamKeyApp + "/" + id, auth.Credentials{User: id, Pass: token}
+				}
+			}
+			// Anything under the enabled app that is not a valid packed Stream Key fails
+			// closed, with any secret-bearing bytes stripped from the canonical path.
+			return streamKeyApp + "/", auth.Credentials{}
 		}
 	}
 
 	return rawPath, auth.Credentials{User: queryUser, Pass: queryPass}
+}
+
+// decodeStreamKey decodes a v1 packed Stream Key (ADR-019-004) into the canonical
+// lowercase hyphenated liveStreamId and the base64url-nopad token string used for
+// Pass.Check. It fails closed (ok=false) on any length / charset / version / shape
+// violation, before any hash compare.
+func decodeStreamKey(key string) (id string, token string, ok bool) {
+	// Stage 1 (pre-decode): exact v1 char count; the base64url alphabet (and the
+	// rejection of any '=' padding or out-of-alphabet char) is enforced by the decoder.
+	// The len(key)==44 gate plus the post-decode len(raw)==33 recheck also neutralise
+	// base64's CR/LF skip (an embedded newline yields <44 significant chars -> not 33
+	// decoded bytes -> reject), so no malleable encoding survives.
+	if len(key) != streamKeyEncodedLen {
+		return "", "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(key)
+	if err != nil || len(raw) != streamKeyDecodedLen || raw[0] != streamKeyVersion {
+		return "", "", false
+	}
+	// Stage 2 (post-decode): fixed byte-split (offsets single-sourced from the v1 layout
+	// constants), no scanning, no delimiter.
+	const idEnd = streamKeyVersionLen + streamKeyIDLen // 17
+	u, err := uuid.FromBytes(raw[streamKeyVersionLen:idEnd])
+	if err != nil {
+		return "", "", false
+	}
+	// Re-encode the 16 token bytes to the 22-char base64url-nopad string Core hashed
+	// (ADR-019-004 §"Token representation chain") -- NOT the raw bytes.
+	return u.String(), base64.RawURLEncoding.EncodeToString(raw[idEnd:streamKeyDecodedLen]), true
 }
 
 func (c *conn) runPublish() error {
