@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -106,7 +107,10 @@ func (c *conn) run() { //nolint:dupl
 
 	c.parent.closeConn(c)
 
-	c.Log(logger.Info, "closed: %v", err)
+	// Every error of runInner (gortmplib's Initialize and AcceptConn, the read and publish
+	// paths) ends up here, and this is the only place that logs it: redact here, not per
+	// call site. Only the logged text changes, never the error or how the connection ends.
+	c.Log(logger.Info, "closed: %v", redactConnErr(c.streamKeyApp, err))
 }
 
 func (c *conn) runInner() error {
@@ -165,18 +169,34 @@ func (c *conn) runReader(errGroupCtx context.Context, errGroup *errgroup.Group) 
 func (c *conn) runRead(errGroupCtx context.Context, errGroup *errgroup.Group) error {
 	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
 	query := c.rconn.URL.Query()
+	rawQuery := c.rconn.URL.RawQuery
+	queryUser := query.Get("user")
+	queryPass := query.Get("pass")
+
+	// ADR-019-003/004 read-side hardening (see parsePublishAccess): Stream Keys are
+	// publish-only credentials, so a key — or a truncated key — pasted into a play URL
+	// (e.g. a publisher's push URL pointed at a player) must never become a path name or
+	// query that reaches routing, logs, API, metrics, hooks or external auth. Fail closed
+	// with the same token-free sentinel the publish side uses (rejected by path-name
+	// validation before authentication). Disabled deployments are byte-for-byte stock.
+	if c.streamKeyApp != "" && conf.StreamKeyBearsKeyMaterial(pathName, rawQuery) {
+		pathName = c.streamKeyApp + "/"
+		rawQuery = ""
+		queryUser = ""
+		queryPass = ""
+	}
 
 	res, err := c.pathManager.AddReader(defs.PathAddReaderReq{
 		Author: c,
 		AccessRequest: defs.PathAccessRequest{
 			Name:      pathName,
-			Query:     c.rconn.URL.RawQuery,
+			Query:     rawQuery,
 			UserAgent: c.userAgent,
 			Proto:     auth.ProtocolRTMP,
 			ID:        &c.uuid,
 			Credentials: &auth.Credentials{
-				User: query.Get("user"),
-				Pass: query.Get("pass"),
+				User: queryUser,
+				Pass: queryPass,
 			},
 			IP:                   c.ip(),
 			EnableAskCredentials: false,
@@ -214,7 +234,7 @@ func (c *conn) runRead(errGroupCtx context.Context, errGroup *errgroup.Group) er
 	c.mutex.Lock()
 	c.state = defs.APIRTMPConnStateRead
 	c.pathName = pathName
-	c.query = c.rconn.URL.RawQuery
+	c.query = rawQuery
 	c.user = res.AuthRes.User
 	c.expiresAt = res.AuthRes.ExpiresAt
 	c.mutex.Unlock()
@@ -242,7 +262,7 @@ func (c *conn) runRead(errGroupCtx context.Context, errGroup *errgroup.Group) er
 		Conf:            res.Path.SafeConf(),
 		ExternalCmdEnv:  res.Path.ExternalCmdEnv(),
 		Reader:          *c.APIReaderDescribe(),
-		Query:           c.rconn.URL.RawQuery,
+		Query:           rawQuery,
 	})
 	defer onUnreadHook()
 
@@ -267,17 +287,16 @@ func (c *conn) runRead(errGroupCtx context.Context, errGroup *errgroup.Group) er
 	}
 }
 
-// v1 packed Stream Key (ADR-019-004): base64url-nopad( version(1B) || liveStreamId(16B)
-// || token(16B) ). 33 decoded bytes -> exactly 44 base64url chars, all in [A-Za-z0-9_-].
-// The 16/16 byte layout is single-sourced here (ADR-019-004 invariant (d)): a wrong
-// literal offset would silently mis-split id/token, so the offsets derive from these.
+// v1 packed Stream-Key layout constants and the key-material shape detector are
+// single-sourced in internal/conf (ADR-019-004 invariant (d)); they live there so that
+// Conf.Validate rejects a key-shaped rtmpStreamKeyApp with the exact predicate the
+// servers enforce at runtime. Aliased here to keep the decode logic readable.
 const (
-	streamKeyVersion    = 0x01                                                     // v1 layout discriminator (fail-closed)
-	streamKeyVersionLen = 1                                                        // version byte
-	streamKeyIDLen      = 16                                                       // liveStreamId (raw UUID) bytes
-	streamKeyTokenLen   = 16                                                       // 128-bit token bytes
-	streamKeyDecodedLen = streamKeyVersionLen + streamKeyIDLen + streamKeyTokenLen // 33
-	streamKeyEncodedLen = 44                                                       // base64url-nopad(33 bytes), no '='
+	streamKeyVersion    = conf.StreamKeyVersion
+	streamKeyVersionLen = conf.StreamKeyVersionLen
+	streamKeyIDLen      = conf.StreamKeyIDLen
+	streamKeyDecodedLen = conf.StreamKeyDecodedLen
+	streamKeyEncodedLen = conf.StreamKeyEncodedLen
 )
 
 // parsePublishAccess ADDS the ADR-019-003/004 RTMP packed Stream-Key auth for PUBLISH.
@@ -303,8 +322,43 @@ const (
 // key with a wrong/revoked token decodes normally and is rejected by the auth gate
 // (auth-denied), preserving an indistinguishable rejection surface for credential failures.
 //
-// Every path NOT under the enabled app keeps MediaMTX's existing behaviour unchanged (raw
-// path name + query-string user/pass), so a disabled deployment is byte-identical to stock.
+// gortmplib v1.0.0 (the v1.20.0 base) changed URL assembly: ServerConn.URL is now the
+// client-controlled tcURL joined with the Stream Key argument of the client's publish (or,
+// for reads, play) command, and the RTMP connect command's app field is parsed but
+// unexported — the server can no longer see which app the client addressed. Two
+// consequences are handled here:
+//
+//   - A client that sends the app only in the connect command (tcURL without a path — legal
+//     RTMP, and exactly what gortmplib v0.4.0 used to normalise to "<app>/<key>") now yields
+//     a bare single-segment "<key>" path. When enabled, a single segment of the exact packed
+//     length that DECODES as a valid v1 Stream Key is therefore accepted as a Stream-Key
+//     publish under the enabled app. This is sound without seeing the connect app: the key
+//     itself fully determines the canonical path and the credentials, and the auth gate
+//     still requires the token hash to match live/<uuid>'s provisioned user.
+//   - Fail-closed hardening: when enabled, no path or query bearing Stream-Key material
+//     (see conf.StreamKeyBearsKeyMaterial / conf.StreamKeySegmentShaped for the flagged
+//     shapes — near-packed-length band, v1-prefix decodes, embedded key windows, and
+//     delimiter-split reconstruction) is ever used as part of a raw path name — any such
+//     path is rejected as "<streamKeyApp>/" (uniform, secret-free) instead of flowing to
+//     routing, logs, API, metrics or hooks. This keeps the ADR-019-003
+//     token-never-in-telemetry invariant for corrupted keys, keys addressed to the wrong
+//     app, and the other URL shapes gortmplib v1.0.0 can produce from a hostile or
+//     misconfigured tcURL. Deliberate consequences (strict app
+//     binding): a valid key under a DIFFERENT app fails closed instead of publishing
+//     vanilla (pre-v1.20.0 it published vanilla, leaking the key as a path name), and the
+//     fail-closed sentinel always names the CONFIGURED app even when the client addressed
+//     another one.
+//
+// A tcURL that itself carries a query ("rtmp://host/live?x=1") plus a Stream Key: gortmplib
+// v1.0.0 swallowed the key into RawQuery (Path stayed "/live", fail closed); v1.0.6, the
+// version this tree builds against, parses tcURL and key separately and merges path and
+// query (joinURL, server_conn.go), so the key lands in the PATH ("/live/<key>") and the
+// publish is accepted; the tcURL's own query is then stripped like any other (see
+// runPublish). The v1.0.0 behaviour survives only as the defensive RawQuery check in
+// runPublish. Every other path — one neither under the enabled app nor carrying
+// Stream-Key material — keeps MediaMTX's existing behaviour unchanged (raw path name +
+// query-string user/pass). A disabled deployment (streamKeyApp == "") is byte-identical
+// to stock in all cases.
 func parsePublishAccess(streamKeyApp, rawPath, queryUser, queryPass string) (canonical string, creds auth.Credentials) {
 	if streamKeyApp != "" {
 		segments := strings.Split(rawPath, "/")
@@ -318,10 +372,62 @@ func parsePublishAccess(streamKeyApp, rawPath, queryUser, queryPass string) (can
 			// closed, with any secret-bearing bytes stripped from the canonical path.
 			return streamKeyApp + "/", auth.Credentials{}
 		}
+
+		// gortmplib v1.0.0: app carried only in the connect command (unexported there), so
+		// the URL path is the bare Stream Key. A valid key is accepted under the enabled
+		// app; a key-shaped segment that does not decode fails closed below.
+		if len(segments) == 1 && len(segments[0]) == streamKeyEncodedLen {
+			if id, token, ok := decodeStreamKey(segments[0]); ok {
+				return streamKeyApp + "/" + id, auth.Credentials{User: id, Pass: token}
+			}
+		}
+
+		// Fail-closed hardening: a path bearing Stream-Key material — a whole key, a
+		// truncated/mangled key, or a key split across segments by an inserted '/' — must
+		// never become a raw path name (it may be, or contain most of, a live token). The
+		// path/query-boundary split is caught at the runPublish level, which has the query.
+		if conf.StreamKeyBearsKeyMaterial(rawPath, "") {
+			return streamKeyApp + "/", auth.Credentials{}
+		}
 	}
 
 	return rawPath, auth.Credentials{User: queryUser, Pass: queryPass}
 }
+
+// redactConnErr keeps Stream-Key material out of the "closed: ..." log line, the one sink
+// of every error of a connection (Codex round 1 finding 1, round 2 finding A). Invariant:
+// key material never appears in a log line. Library errors quote client-supplied text:
+// gortmplib's Initialize returns "invalid connect command: %+v" with the whole connect
+// command (tcUrl, key included) when "app" is missing or not a string; AcceptConn builds
+// ServerConn.URL with url.Parse on the tcURL and on "./"+<publish/play stream key>, and a
+// bad escape ("%", "%zz") makes a *url.Error whose text quotes its whole input. With the
+// feature enabled a *url.Error is replaced by a fixed error that keeps only the operation,
+// and any other error whose text bears key material is replaced as well. It changes only
+// what is logged: the caller still returns the original error. Disabled
+// (streamKeyApp == ""), the error is returned untouched, byte-identical to stock.
+func redactConnErr(streamKeyApp string, err error) error {
+	if streamKeyApp == "" || err == nil {
+		return err
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("invalid RTMP URL (%s)", urlErr.Op)
+	}
+
+	// The scanner sees the text without the spaces and quotes of an error message, which
+	// would otherwise split a key from the delimiters around it.
+	text := strings.NewReplacer(" ", "", "\"", "", "'", "", "`", "").Replace(err.Error())
+	if conf.StreamKeyBearsKeyMaterial(text, "") {
+		return errors.New("invalid RTMP request")
+	}
+
+	return err
+}
+
+// Key-material detection (conf.StreamKeySegmentShaped and friends) is single-sourced in
+// internal/conf/streamkey.go — see its doc comments for the flagged shapes, the accepted
+// detection boundary, and the documented false-positive class on enabled servers.
 
 // decodeStreamKey decodes a v1 packed Stream Key (ADR-019-004) into the canonical
 // lowercase hyphenated liveStreamId and the base64url-nopad token string used for
@@ -355,14 +461,38 @@ func decodeStreamKey(key string) (id string, token string, ok bool) {
 func (c *conn) runPublish(errGroupCtx context.Context, errGroup *errgroup.Group) error {
 	pathName := strings.TrimLeft(c.rconn.URL.Path, "/")
 	query := c.rconn.URL.Query()
+	rawQuery := c.rconn.URL.RawQuery
 
 	canonicalName, creds := parsePublishAccess(c.streamKeyApp, pathName, query.Get("user"), query.Get("pass"))
+
+	if c.streamKeyApp != "" {
+		sentinel := c.streamKeyApp + "/"
+		// parsePublishAccess is path-only. If it passed the path through verbatim (vanilla,
+		// no key material in the path alone), the query can still carry key material —
+		// swallowed there by gortmplib v1.0.0 when the tcURL has a query (v1.0.6 puts it in
+		// the path), or a key split across the path/query boundary by an inserted '?'. Re-check the path AND query
+		// together and fail closed if either, or their delimiter-stripped reconstruction,
+		// bears key material.
+		vanilla := canonicalName == pathName && canonicalName != sentinel
+		if vanilla && conf.StreamKeyBearsKeyMaterial(pathName, rawQuery) {
+			canonicalName, creds = sentinel, auth.Credentials{}
+		}
+		// Whenever the stream-key feature produced the canonical name (accepted key -> uuid,
+		// or fail-closed sentinel), the query is not a credential carrier for this publish:
+		// strip it so nothing secret-adjacent reaches external auth, hooks or telemetry
+		// through the Query field. The sentinel is tested explicitly — the raw path can
+		// itself be "<app>/" (empty publish stream key), making the names equal even though
+		// the fail-closed branch handled it. Vanilla pass-through publishes keep the query.
+		if canonicalName != pathName || canonicalName == sentinel {
+			rawQuery = ""
+		}
+	}
 
 	res1, err := c.pathManager.FindPathConf(defs.PathFindPathConfReq{
 		Author: c,
 		AccessRequest: defs.PathAccessRequest{
 			Name:                 canonicalName,
-			Query:                c.rconn.URL.RawQuery,
+			Query:                rawQuery,
 			Publish:              true,
 			UserAgent:            c.userAgent,
 			Proto:                auth.ProtocolRTMP,
@@ -422,7 +552,7 @@ func (c *conn) runPublish(errGroupCtx context.Context, errGroup *errgroup.Group)
 		ConfToCompare: res1.Conf,
 		AccessRequest: defs.PathAccessRequest{
 			Name:     canonicalName,
-			Query:    c.rconn.URL.RawQuery,
+			Query:    rawQuery,
 			Publish:  true,
 			SkipAuth: true,
 		},
@@ -438,7 +568,7 @@ func (c *conn) runPublish(errGroupCtx context.Context, errGroup *errgroup.Group)
 	c.mutex.Lock()
 	c.state = defs.APIRTMPConnStatePublish
 	c.pathName = canonicalName
-	c.query = c.rconn.URL.RawQuery
+	c.query = rawQuery
 	c.user = res1.AuthRes.User
 	c.expiresAt = res1.AuthRes.ExpiresAt
 	c.mutex.Unlock()
