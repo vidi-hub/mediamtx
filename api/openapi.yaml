@@ -580,6 +580,8 @@ components:
           type: string
         rtmpServerKey:
           type: string
+        rtmpStreamKeyApp:
+          type: string
         rtmpTrustedProxies:
           type: array
           items:

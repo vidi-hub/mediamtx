@@ -309,6 +309,19 @@ rtmpServerCert: server.crt
 # If the server receives a request from one of these entries, IP in logs
 # and authentication will be taken from the PROXY protocol header.
 rtmpTrustedProxies: []
+# Fork extension (ADR-019-003/004): app under which a publish path carries a packed
+# Stream Key (base64url of version || liveStreamId || token) that is decoded into
+# per-path credentials, with the canonical path rewritten to <app>/<liveStreamId>.
+# Empty (the default) disables the feature and keeps stock behaviour.
+# Constraint while enabled: RTMP path segments and query tokens that are Stream-Key
+# shaped are failed closed on every app, publish and read alike, so tokens can never
+# reach logs, API, metrics or hooks. "Stream-Key shaped" means any of: within a few
+# characters of the 44-char packed key length (any characters); base64url text that
+# decodes to a 0x01-led blob of 17+ bytes; or containing a 44-char base64url run that
+# decodes to a 0x01-led 33-byte blob (long random base64url values such as JWT
+# signatures will frequently match). Do not use such names or query values for vanilla
+# RTMP paths on a server that enables this option.
+rtmpStreamKeyApp:
 
 ###############################################
 # Global settings -> HLS server
