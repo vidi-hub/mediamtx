@@ -110,6 +110,17 @@ type Server struct {
 
 // Initialize initializes the server.
 func (s *Server) Initialize() error {
+	// ADR-019-003/004: an app name that is itself Stream-Key shaped would trip the
+	// read-side key-material scan on every canonical "<app>/<uuid>" path (publish green,
+	// all playback dead). Conf.Validate rejects such values at load time; this is the
+	// defense-in-depth backstop for programmatic construction. The value is deliberately
+	// NOT echoed — the most likely key-shaped misconfiguration is a real minted Stream
+	// Key pasted into the wrong field, and the token must never reach the log.
+	if s.StreamKeyApp != "" && conf.StreamKeySegmentShaped(s.StreamKeyApp) {
+		return fmt.Errorf("rtmpStreamKeyApp value is itself Stream-Key shaped (value withheld from log); " +
+			"choose a different app name")
+	}
+
 	listen := func(network, address string) (net.Listener, error) {
 		ln, err := net.Listen(network, address)
 		if err != nil {

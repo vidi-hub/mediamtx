@@ -942,6 +942,28 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		}
 	}
 
+	// Fork extension (ADR-019-003/004): fail fast on a value that could never work — the
+	// runtime gate compares it against a single path segment, so a bad value would
+	// otherwise silently reject every stream-key publish; a Stream-Key-shaped value
+	// would additionally trip the read-side key-material scan on every canonical
+	// "<app>/<uuid>" path (publish green, all playback dead), and rejecting it here
+	// keeps the config API's validate-then-accept contract (the RTMP server's own
+	// Initialize backstop would otherwise take the whole process down on hot reload).
+	// Error messages deliberately do not echo the value: the most likely key-shaped
+	// misconfiguration is a real minted Stream Key pasted into the wrong field.
+	if conf.RTMPStreamKeyApp != "" {
+		if strings.Contains(conf.RTMPStreamKeyApp, "/") {
+			return fmt.Errorf("'rtmpStreamKeyApp' must be a single path segment (cannot contain '/')")
+		}
+		if err := IsValidPathName(conf.RTMPStreamKeyApp); err != nil {
+			return fmt.Errorf("invalid 'rtmpStreamKeyApp': %w", err)
+		}
+		if StreamKeySegmentShaped(conf.RTMPStreamKeyApp) {
+			return fmt.Errorf("'rtmpStreamKeyApp' must not itself be Stream-Key shaped " +
+				"(near the packed key length, or decoding as a packed key prefix); choose a different app name")
+		}
+	}
+
 	// HLS (deprecated params)
 
 	if conf.HLSDisable != nil {

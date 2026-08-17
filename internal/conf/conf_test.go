@@ -762,6 +762,28 @@ func TestConfErrors(t *testing.T) {
 			"'rtmpAddress' must be set when RTMP is enabled",
 		},
 		{
+			"rtmpStreamKeyApp with a slash",
+			"rtmpStreamKeyApp: live/x\n",
+			"'rtmpStreamKeyApp' must be a single path segment (cannot contain '/')",
+		},
+		{
+			"rtmpStreamKeyApp with invalid characters",
+			"rtmpStreamKeyApp: 'live app'\n",
+			"invalid 'rtmpStreamKeyApp': can contain only alphanumeric characters, underscore, dot, minus, slash",
+		},
+		{
+			"rtmpStreamKeyApp with a key-length value (a pasted Stream Key)",
+			"rtmpStreamKeyApp: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+			"'rtmpStreamKeyApp' must not itself be Stream-Key shaped " +
+				"(near the packed key length, or decoding as a packed key prefix); choose a different app name",
+		},
+		{
+			"rtmpStreamKeyApp decoding to a v1 key prefix",
+			"rtmpStreamKeyApp: AQAAAAAAAAAAAAAAAAAAAAAA\n",
+			"'rtmpStreamKeyApp' must not itself be Stream-Key shaped " +
+				"(near the packed key length, or decoding as a packed key prefix); choose a different app name",
+		},
+		{
 			"missing hlsAddress with HLS enabled",
 			"hls: yes\n" +
 				"hlsAddress: ''\n",
@@ -929,4 +951,14 @@ func TestClone(t *testing.T) {
 
 	conf2 := conf1.Clone()
 	require.Equal(t, conf1, conf2)
+}
+
+// TestConfRTMPStreamKeyApp pins the accept path of the fork's rtmpStreamKeyApp
+// validation (reject paths are covered in TestConfErrors).
+func TestConfRTMPStreamKeyApp(t *testing.T) {
+	tmpf := createTempFile(t, []byte("rtmpStreamKeyApp: live\n"))
+
+	cnf, _, err := Load(tmpf, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "live", cnf.RTMPStreamKeyApp)
 }
